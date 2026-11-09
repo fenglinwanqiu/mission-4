@@ -1,0 +1,283 @@
+!pip install -q -U segmentation-models-pytorch
+
+import os, re, glob, random
+import numpy as np
+import pandas as pd
+import cv2
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import segmentation_models_pytorch as smp
+import albumentations as A
+
+assert torch.cuda.is_available(), '请先在 Notebook 设置里把 Accelerator 选成 GPU'
+
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+print('环境 OK，CUDA 可用')
+
+def find_dir(name):
+    for root, dirs, files in os.walk('/kaggle/input'):
+        if os.path.basename(root) == name:
+            return root
+    raise RuntimeError(f'未找到 {name} 目录，请确认 Data 面板里有该数据')
+
+BASE = find_dir('segmentation')
+TRAIN_IMG = os.path.join(BASE, 'train', 'image')
+TRAIN_LBL = os.path.join(BASE, 'train', 'label')
+TEST_IMG  = os.path.join(BASE, 'test', 'image')
+print('数据根目录 =', BASE)
+
+def list_imgs(d):
+    exts = ('*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff', '*.ppm', '*.pgm', '*.gif', '*.pbm')
+    fs = []
+    for e in exts:
+        fs += glob.glob(os.path.join(d, e))
+    return fs
+
+def nat_key(p):
+    m = re.search(r'(\d+)', os.path.basename(p))
+    return int(m.group(1)) if m else 0
+
+train_imgs = sorted(list_imgs(TRAIN_IMG), key=nat_key)
+train_lbls = sorted(list_imgs(TRAIN_LBL), key=nat_key)
+test_imgs  = sorted(list_imgs(TEST_IMG), key=nat_key)
+
+lbl_map = {os.path.basename(p): p for p in train_lbls}
+train_pairs = [(im, lbl_map[os.path.basename(im)]) for im in train_imgs
+               if os.path.basename(im) in lbl_map]
+
+print('训练图/标签配对 =', len(train_pairs), '  测试图 =', len(test_imgs))
+assert len(train_pairs) > 0 and len(test_imgs) > 0
+
+SIZE = 512
+_sample = cv2.imread(train_pairs[0][1], cv2.IMREAD_GRAYSCALE)
+if _sample.max() <= 1:
+    _sample = (_sample * 255).astype(np.uint8)
+VESSEL_VAL = 0 if _sample.mean() > 127 else 255
+print('标签 size=', _sample.shape, ' unique=', np.unique(_sample).tolist(),
+      ' => 血管像素值=', VESSEL_VAL, ' 背景=', 255 - VESSEL_VAL)
+
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+def read_img(p):
+    im = cv2.imread(p, cv2.IMREAD_COLOR)          # BGR
+    g = im[:, :, 1]                               # 绿色通道：血管对比度最高
+    g = clahe.apply(g)                            # CLAHE 增强
+    im = cv2.merge([g, g, g])                     # 复制成 3 通道喂给预训练编码器
+    im = cv2.resize(im, (SIZE, SIZE), interpolation=cv2.INTER_LINEAR)
+    return im
+
+def read_mask(p):
+    m = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+    if m.max() <= 1:
+        m = (m * 255).astype(np.uint8)
+    m = cv2.resize(m, (SIZE, SIZE), interpolation=cv2.INTER_NEAREST)
+    if VESSEL_VAL == 255:
+        return (m > 127).astype(np.float32)
+    else:
+        return (m < 127).astype(np.float32)
+
+train_aug = A.Compose([
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.Affine(scale=(0.9, 1.1), translate_percent=0.0625, rotate=(-20, 20), p=0.5),
+    A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.3),
+    A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.5),
+])
+
+class SegDataset(Dataset):
+    def __init__(self, pairs, train=False):
+        self.pairs = pairs
+        self.train = train
+    def __len__(self):
+        return len(self.pairs)
+    def __getitem__(self, i):
+        imp, lbp = self.pairs[i]
+        im = read_img(imp)
+        lb = read_mask(lbp)
+        if self.train:
+            t = train_aug(image=im, mask=lb)
+            im, lb = t['image'], t['mask']
+        x = (im.astype(np.float32) / 255.0 - MEAN) / STD
+        x = torch.from_numpy(x.transpose(2, 0, 1)).float()
+        y = torch.from_numpy(lb).float().unsqueeze(0)
+        return x, y
+
+def dice_loss(logits, target):
+    p = torch.sigmoid(logits)
+    inter = (p * target).sum(dim=(2, 3))
+    union = p.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+    return (1 - (2 * inter + 1.0) / (union + 1.0)).mean()
+
+def criterion(logits, target):
+    return F.binary_cross_entropy_with_logits(logits, target) + dice_loss(logits, target)
+
+def build_model():
+    return smp.Unet(encoder_name='resnet34', encoder_weights='imagenet',
+                    in_channels=3, classes=1).cuda()
+
+BS = 4
+
+def predict_tta(model, x):
+    # 测试时增强：原图 + 水平翻转 + 垂直翻转，取平均概率
+    p = torch.sigmoid(model(x))
+    p = p + torch.flip(torch.sigmoid(model(torch.flip(x, dims=[3]))), dims=[3])
+    p = p + torch.flip(torch.sigmoid(model(torch.flip(x, dims=[2]))), dims=[2])
+    return p / 3.0
+
+def train_epoch(model, loader, opt, scaler):
+    model.train()
+    losses = []
+    for x, y in loader:
+        x, y = x.cuda(), y.cuda()
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast('cuda'):
+            logits = model(x)
+            loss = criterion(logits, y)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+        losses.append(loss.item())
+    return float(np.mean(losses))
+
+@torch.no_grad()
+def dice_score(model, loader, thresh=0.5, tta=False):
+    model.eval()
+    ds = []
+    for x, y in loader:
+        x, y = x.cuda(), y.cuda()
+        with torch.amp.autocast('cuda'):
+            p = predict_tta(model, x) if tta else torch.sigmoid(model(x))
+        p = (p > thresh).float()
+        inter = (p * y).sum()
+        ds.append(float((2 * inter + 1e-7) / (p.sum() + y.sum() + 1e-7)))
+    return float(np.mean(ds))
+
+def run(train_pairs, val_pairs, epochs):
+    model = build_model()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler('cuda')
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    tr_loader = DataLoader(SegDataset(train_pairs, train=True), batch_size=BS,
+                           shuffle=True, num_workers=0, pin_memory=True)
+    va_loader = (DataLoader(SegDataset(val_pairs, train=False), batch_size=BS,
+                            shuffle=False, num_workers=0, pin_memory=True)
+                 if val_pairs else None)
+    for ep in range(1, epochs + 1):
+        loss = train_epoch(model, tr_loader, opt, scaler)
+        sched.step()
+        s = f'Epoch {ep}/{epochs}  loss={loss:.4f}'
+        if va_loader:
+            s += f'  val_dice={dice_score(model, va_loader):.4f}'
+        print(s)
+    return model, va_loader
+
+def sweep_threshold(model, va_loader):
+    best_t, best_d = 0.5, 0.0
+    print('--- 阈值搜索（含 TTA）---')
+    for t in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+        d = dice_score(model, va_loader, thresh=t, tta=True)
+        print(f'  thresh={t:.2f}  val_dice={d:.4f}')
+        if d > best_d:
+            best_d, best_t = d, t
+    print(f'=== 最佳阈值 {best_t:.2f} (dice {best_d:.4f}) ===')
+    return best_t
+
+from sklearn.model_selection import KFold
+
+kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
+folds = list(kf.split(np.arange(len(train_pairs))))
+
+test_probs = []
+oof_probs = np.zeros((len(train_pairs), SIZE, SIZE), dtype=np.float32)
+oof_target = np.zeros((len(train_pairs), SIZE, SIZE), dtype=np.float32)
+
+for fi, (tr_idx, va_idx) in enumerate(folds):
+    print(f'========== Fold {fi+1}/5 ==========')
+    tr = [train_pairs[i] for i in tr_idx]
+    va = [train_pairs[i] for i in va_idx]
+    model, _ = run(tr, va, epochs=120)
+    model.eval()
+
+    ft = []
+    for p in test_imgs:
+        im = read_img(p)
+        x = (im.astype(np.float32) / 255.0 - MEAN) / STD
+        x = torch.from_numpy(x.transpose(2, 0, 1)).float().unsqueeze(0).cuda()
+        with torch.amp.autocast('cuda'), torch.no_grad():
+            pr = predict_tta(model, x)[0, 0].cpu().numpy()
+        ft.append(pr)
+    test_probs.append(np.stack(ft))                    # (20, SIZE, SIZE)
+
+    for i in va_idx:
+        imp, lbp = train_pairs[i]
+        im = read_img(imp)
+        x = (im.astype(np.float32) / 255.0 - MEAN) / STD
+        x = torch.from_numpy(x.transpose(2, 0, 1)).float().unsqueeze(0).cuda()
+        with torch.amp.autocast('cuda'), torch.no_grad():
+            pr = predict_tta(model, x)[0, 0].cpu().numpy()
+        oof_probs[i] = pr
+        oof_target[i] = read_mask(lbp)
+
+print('5 折训练完成')
+
+test_prob = np.mean(np.stack(test_probs), axis=0)      # (20, SIZE, SIZE)
+oof_target = (oof_target > 0.5).astype(np.uint8)
+
+def dice_np(pred, gt):
+    inter = float((pred * gt).sum())
+    return 2 * inter / (float(pred.sum()) + float(gt.sum()) + 1e-7)
+
+print('--- OOF 阈值搜索（5 折平均 + TTA）---')
+best_t, best_d = 0.65, 0.0
+for t in [0.55, 0.60, 0.65, 0.70, 0.75]:
+    d = dice_np((oof_probs > t).astype(np.uint8), oof_target)
+    print(f'  thresh={t:.2f}  OOF_dice={d:.4f}')
+    if d > best_d:
+        best_d, best_t = d, t
+print(f'=== 最佳阈值 {best_t:.2f} (OOF dice {best_d:.4f}) ===')
+THRESH = best_t
+
+def rle_encode(mask):
+    img = Image.fromarray(mask.astype(np.uint8)).convert('L')
+    img = img.resize((SIZE, SIZE), Image.Resampling.BILINEAR)
+    flat = (np.array(img) > 0).astype(np.uint8).flatten()
+    dots = np.where(flat == 1)[0]
+    runs = []
+    prev = -2
+    for b in dots:
+        if b > prev + 1:
+            runs.extend((int(b) + 1, 0))
+        runs[-1] += 1
+        prev = b
+    return ' '.join(str(r) for r in runs)
+
+os.makedirs('./image', exist_ok=True)
+sub_ids, sub_rles = [], []
+for k, p in enumerate(test_imgs):
+    prob = test_prob[k]
+    pred_bin = (prob > THRESH).astype(np.uint8)
+    mask = np.full_like(pred_bin, 255 - VESSEL_VAL, dtype=np.uint8)
+    mask[pred_bin == 1] = VESSEL_VAL
+    name = os.path.basename(p)
+    Image.fromarray(mask).save(os.path.join('./image', name))
+    sub_ids.append(os.path.splitext(name)[0])
+    sub_rles.append(rle_encode(mask))
+
+df = pd.DataFrame({'Id': sub_ids, 'Predicted': sub_rles})
+df.to_csv('submission.csv', index=False)
+print('已生成 submission.csv，共', len(df), '行')
+print(df.head(10).to_string())
+print('非空预测(有血管)的图数 =', sum(len(s) > 0 for s in sub_rles), '/', len(sub_rles))
